@@ -84,9 +84,13 @@ By Alex Ellis %d - %s (%s)
 		panic("--file and --flake are mutually exclusive")
 	}
 
+	if !ghCLIToken && tokenFile == "" {
+		panic("No token provided. Use --token-file <path> or --gh-cli-token to use your gh CLI session.")
+	}
+
 	if !ghCLIToken {
 		if _, err := os.Stat(tokenFile); err != nil && os.IsNotExist(err) {
-			panic("Please provide a valid token file")
+			panic(fmt.Sprintf("Token file not found: %s", tokenFile))
 		}
 	}
 
