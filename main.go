@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"path"
@@ -33,7 +34,9 @@ func main() {
 	var (
 		owner                string
 		fileName             string
+		flakeRef             string
 		tokenFile            string
+		ghCLIToken              bool
 		privateRepo          bool
 		organisation         bool
 		runsOn               string
@@ -48,7 +51,9 @@ func main() {
 
 	flag.StringVar(&owner, "owner", "actuated-samples", "The owner of the GitHub repository")
 	flag.StringVar(&fileName, "file", "", "The name of the file to run via a GitHub Action")
+	flag.StringVar(&flakeRef, "flake", "", "A Nix flake reference to run, e.g. github:user/repo#app (mutually exclusive with --file)")
 	flag.StringVar(&tokenFile, "token-file", "", "The name of the PAT token file")
+	flag.BoolVar(&ghCLIToken, "gh-cli-token", false, "Use the token from gh auth (requires gh CLI)")
 	flag.BoolVar(&organisation, "org", true, "Create the repository in an organization")
 	flag.StringVar(&runsOn, "runs-on", "ubuntu-latest", "Runner label for the GitHub action, use ubuntu-latest for a hosted runner")
 	flag.BoolVar(&privateRepo, "private", false, "Make the repository private")
@@ -71,12 +76,18 @@ By Alex Ellis %d - %s (%s)
 
 `, time.Now().Year(), pkg.Version, pkg.GitCommit)
 
-	if fileName == "" {
-		panic("--file is required")
+	if fileName == "" && flakeRef == "" {
+		panic("--file or --flake is required")
 	}
 
-	if _, err := os.Stat(tokenFile); err != nil && os.IsNotExist(err) {
-		panic("Please provide a valid token file")
+	if fileName != "" && flakeRef != "" {
+		panic("--file and --flake are mutually exclusive")
+	}
+
+	if !ghCLIToken {
+		if _, err := os.Stat(tokenFile); err != nil && os.IsNotExist(err) {
+			panic("Please provide a valid token file")
+		}
 	}
 
 	if len(secretsFrom) > 0 {
@@ -88,7 +99,11 @@ By Alex Ellis %d - %s (%s)
 	}
 
 	repoName := names.GetRandomName(5)
-	fmt.Printf("Job file: %s\n", path.Base(fileName))
+	if flakeRef != "" {
+		fmt.Printf("Flake: %s\n", flakeRef)
+	} else {
+		fmt.Printf("Job file: %s\n", path.Base(fileName))
+	}
 	fmt.Printf("Repo: https://github.com/%s/%s\n", owner, repoName)
 
 	t := os.TempDir()
@@ -118,9 +133,19 @@ By Alex Ellis %d - %s (%s)
 		login = loginU.Username
 	}
 
-	token, err := os.ReadFile(tokenFile)
-	if err != nil {
-		log.Panicf("failed to read token file: %s", err)
+	var token []byte
+	if ghCLIToken {
+		out, err := exec.Command("gh", "auth", "token").Output()
+		if err != nil {
+			log.Panicf("failed to get token from gh auth: %s", err)
+		}
+		token = out
+	} else {
+		var err error
+		token, err = os.ReadFile(tokenFile)
+		if err != nil {
+			log.Panicf("failed to read token file: %s", err)
+		}
 	}
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(
@@ -165,11 +190,12 @@ By Alex Ellis %d - %s (%s)
 	}
 
 	out, err := templates.Render(templates.RenderParams{
-		Name:    repoName,
-		Login:   login,
-		Date:    time.Now().String(),
-		RunsOn:  runsOn,
-		Secrets: secretsMap,
+		Name:     repoName,
+		Login:    login,
+		Date:     time.Now().String(),
+		RunsOn:   runsOn,
+		Secrets:  secretsMap,
+		FlakeRef: flakeRef,
 	})
 	if err != nil {
 		log.Panicf("failed to render workflow template: %s", err)
@@ -181,41 +207,43 @@ By Alex Ellis %d - %s (%s)
 
 	f.Close()
 
-	fIn, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
-	if err != nil {
-		log.Panicf("failed to open file: %s", err)
-	}
-	defer fIn.Close()
+	if fileName != "" {
+		fIn, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
+		if err != nil {
+			log.Panicf("failed to open file: %s", err)
+		}
+		defer fIn.Close()
 
-	jobFile := path.Join(tmp, "/job.sh")
-	fsh, err := os.Create(jobFile)
-	if err != nil {
-		log.Panicf("failed to create workflow file: %s", err)
-	}
-	defer fsh.Close()
+		jobFile := path.Join(tmp, "/job.sh")
+		fsh, err := os.Create(jobFile)
+		if err != nil {
+			log.Panicf("failed to create workflow file: %s", err)
+		}
+		defer fsh.Close()
 
-	if _, err := io.Copy(fsh, fIn); err != nil {
-		log.Panicf("failed to copy file: %s", err)
+		if _, err := io.Copy(fsh, fIn); err != nil {
+			log.Panicf("failed to copy file: %s", err)
+		}
+
+		fileBytes, err := os.ReadFile(jobFile)
+		if err != nil {
+			log.Panicf("failed to read job file: %s", err)
+		}
+		if _, _, err := client.Repositories.CreateFile(ctx, owner, repoName, "job.sh",
+			&github.RepositoryContentFileOptions{
+				Message: github.String("Add job.sh"),
+				Content: []byte(fileBytes),
+				Author: &github.CommitAuthor{
+					Name:  github.String("actuated-batch"),
+					Email: github.String("actuated-samples@users.noreply.github.com"),
+				},
+				Branch: github.String(branch),
+			}); err != nil {
+			log.Panicf("failed to create workflow file: %s", err)
+		}
 	}
 
-	fileBytes, err := os.ReadFile(jobFile)
-	if err != nil {
-		log.Panicf("failed to read job file: %s", err)
-	}
-	if _, _, err := client.Repositories.CreateFile(ctx, owner, repoName, "job.sh",
-		&github.RepositoryContentFileOptions{
-			Message: github.String("Add job.sh"),
-			Content: []byte(fileBytes),
-			Author: &github.CommitAuthor{
-				Name:  github.String("actuated-batch"),
-				Email: github.String("actuated-samples@users.noreply.github.com"),
-			},
-			Branch: github.String(branch),
-		}); err != nil {
-		log.Panicf("failed to create workflow file: %s", err)
-	}
-
-	fileBytes, err = os.ReadFile(actionsFile)
+	fileBytes, err := os.ReadFile(actionsFile)
 	if err != nil {
 		log.Panicf("failed to read workflow file: %s", err)
 	}

@@ -48,7 +48,11 @@ cd actions-batch
 
 You'll need a Personal Access Token (PAT) with: delete_repo, repo, workflow, write:packages.
 
-You can download a binary from the [Releases page](https://github.com/alexellis/actions-batch/releases) or build it from source.
+You can download a binary from the [Releases page](https://github.com/alexellis/actions-batch/releases), build it from source, or run it with Nix:
+
+```bash
+nix run github:blessuselessk/actions-batch -- --help
+```
 
 ### Generate some ASCII art with your personal repo
 
@@ -244,6 +248,89 @@ Loaded image: curl:latest
 
 docker run -t curl:latest --version
 ```
+
+## Nix support
+
+actions-batch is packaged as a Nix flake. You can run it directly without installing:
+
+```bash
+nix run github:blessuselessk/actions-batch -- \
+  --file examples/cowsay.sh \
+  --owner your-org \
+  --token-file ~/pat.txt
+```
+
+Or enter a dev shell with Go and tooling:
+
+```bash
+nix develop github:blessuselessk/actions-batch
+```
+
+### Running Nix apps as jobs
+
+Instead of writing bash scripts that `apt-get install` their dependencies, jobs can be Nix flake apps. Use `--flake` instead of `--file`:
+
+```bash
+nix run github:blessuselessk/actions-batch -- \
+  --flake "github:user/repo#app" \
+  --owner your-org \
+  --token-file ~/pat.txt
+```
+
+This installs Nix on the runner (via [DeterminateSystems/nix-installer-action](https://github.com/DeterminateSystems/nix-installer-action)) and runs `nix run <flake-ref>` instead of a shell script. Builds are cached across runs with [magic-nix-cache-action](https://github.com/DeterminateSystems/magic-nix-cache-action).
+
+### Composable pipelines
+
+Because jobs are Nix apps, one job can depend on another — composition is just a flake input:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    data-tools.url = "github:your-org/data-tools";
+  };
+
+  outputs = { nixpkgs, data-tools, ... }:
+  let
+    pkgs = nixpkgs.legacyPackages.x86_64-linux;
+  in {
+    apps.x86_64-linux.default = {
+      type = "app";
+      program = "${pkgs.writeShellApplication {
+        name = "pipeline";
+        runtimeInputs = [
+          data-tools.packages.x86_64-linux.fetch-dataset
+          pkgs.jq
+        ];
+        text = ''
+          fetch-dataset | jq '.results' > uploads/processed.json
+        '';
+      }}/bin/pipeline";
+    };
+  };
+}
+```
+
+`fetch-dataset` is a dependency, not a subprocess — if it's already built (locally or in a binary cache), it's instant. Write output to `uploads/` and it gets downloaded to your machine, same as with `--file`.
+
+```bash
+# Run the pipeline on GitHub Actions
+nix run github:blessuselessk/actions-batch -- \
+  --flake "github:your-org/my-pipeline#default" \
+  --owner your-org \
+  --token-file ~/pat.txt \
+  --out ./results
+```
+
+### Why Nix over bash scripts?
+
+The [examples/](examples/) scripts work, but each one re-invents environment setup: `apt-get install`, `curl | bash`, `pip install` with no version pins. Every run downloads and builds from scratch.
+
+With Nix flake apps:
+- **Reproducible** — inputs are locked, builds are content-addressed
+- **Cached** — unchanged dependencies aren't rebuilt
+- **Composable** — jobs reference other jobs as flake inputs
+- **Testable locally** — `nix run .#app` works on your machine before submitting to the cloud
 
 ## What's left
 

@@ -2,37 +2,43 @@ package templates
 
 import (
 	"bytes"
-	"log"
-	"os"
+	_ "embed"
+	"fmt"
 	"text/template"
 )
 
+//go:embed workflow.yaml
+var workflowTemplate string
+
+//go:embed workflow-nix.yaml
+var workflowNixTemplate string
+
 func Render(p RenderParams) (string, error) {
 
-	tmplPath := "./templates/workflow.yaml"
-	if _, err := os.Stat(tmplPath); err != nil && os.IsNotExist(err) {
-		tmplPath = "./workflow.yaml"
+	tmplStr := workflowTemplate
+	if p.FlakeRef != "" {
+		tmplStr = workflowNixTemplate
 	}
 
-	tmpl := template.Must(template.ParseFiles(tmplPath))
-	workflowT, err := tmpl.ParseFiles(tmplPath)
+	tmpl, err := template.New("workflow").Parse(tmplStr)
 	if err != nil {
-		log.Panicf("failed to parse workflow template: %s", err)
+		return "", fmt.Errorf("failed to parse workflow template: %w", err)
 	}
 
 	buf := bytes.NewBuffer(nil)
 
-	if err := workflowT.Execute(buf, p); err != nil {
-		log.Panicf("failed to execute workflow template: %s", err)
+	if err := tmpl.Execute(buf, p); err != nil {
+		return "", fmt.Errorf("failed to execute workflow template: %w", err)
 	}
 
 	return buf.String(), nil
 }
 
 type RenderParams struct {
-	Name    string
-	Login   string
-	Date    string
-	RunsOn  string
-	Secrets map[string]string
+	Name     string
+	Login    string
+	Date     string
+	RunsOn   string
+	Secrets  map[string]string
+	FlakeRef string
 }
