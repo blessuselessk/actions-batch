@@ -1,0 +1,10 @@
+      # Tailscale mesh — join the OCD tailnet as an ephemeral runner.
+      # Requires TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET as repo secrets.
+      - name: Join Tailscale mesh
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          tags: tag:runner
+          hostname: runner-${{ github.run_id }}-${{ strategy.job-index }}
+          version: latest

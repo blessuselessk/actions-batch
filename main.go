@@ -36,7 +36,7 @@ func main() {
 		fileName             string
 		flakeRef             string
 		tokenFile            string
-		ghCLIToken              bool
+		ghCLIToken           bool
 		privateRepo          bool
 		organisation         bool
 		runsOn               string
@@ -47,6 +47,9 @@ func main() {
 		fetchLogsInterval    time.Duration
 		verbose              bool
 		artifactsPath        string
+		artifactsRepo        string
+		listArtifactsFlag    bool
+		tailscale            bool
 	)
 
 	flag.StringVar(&owner, "owner", "actuated-samples", "The owner of the GitHub repository")
@@ -64,6 +67,9 @@ func main() {
 	flag.BoolVar(&deleteRepo, "delete", true, "Delete the repository after the run")
 	flag.BoolVar(&verbose, "verbose", false, "Verbose logging")
 	flag.StringVar(&artifactsPath, "out", "", "Path to use to unzip the artifacts folder from the build, if there is one")
+	flag.StringVar(&artifactsRepo, "artifacts-repo", "", "Persist artifacts to a GitHub release in this repo (format: owner/repo)")
+	flag.BoolVar(&listArtifactsFlag, "list-artifacts", false, "List all tracked artifacts and exit")
+	flag.BoolVar(&tailscale, "tailscale", false, "Join the OCD tailnet mesh as tag:runner (requires TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET secrets)")
 
 	flag.Parse()
 
@@ -75,6 +81,20 @@ func main() {
 By Alex Ellis %d - %s (%s)
 
 `, time.Now().Year(), pkg.Version, pkg.GitCommit)
+
+	if listArtifactsFlag {
+		if err := listArtifacts(); err != nil {
+			log.Fatalf("Failed to list artifacts: %s", err)
+		}
+		return
+	}
+
+	if artifactsRepo != "" {
+		parts := strings.SplitN(artifactsRepo, "/", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			log.Panicf("--artifacts-repo must be in format owner/repo, got: %s", artifactsRepo)
+		}
+	}
 
 	if fileName == "" && flakeRef == "" {
 		panic("--file or --flake is required")
@@ -194,12 +214,13 @@ By Alex Ellis %d - %s (%s)
 	}
 
 	out, err := templates.Render(templates.RenderParams{
-		Name:     repoName,
-		Login:    login,
-		Date:     time.Now().String(),
-		RunsOn:   runsOn,
-		Secrets:  secretsMap,
-		FlakeRef: flakeRef,
+		Name:      repoName,
+		Login:     login,
+		Date:      time.Now().String(),
+		RunsOn:    runsOn,
+		Secrets:   secretsMap,
+		FlakeRef:  flakeRef,
+		Tailscale: tailscale,
 	})
 	if err != nil {
 		log.Panicf("failed to render workflow template: %s", err)
@@ -415,8 +436,46 @@ By Alex Ellis %d - %s (%s)
 				}
 			}
 
-			if err := downloadArtifacts(ctx, client, owner, repoName, wf.GetID(), artifactsPath); err != nil {
-				log.Printf("failed to download artifacts: %s", err)
+			files, outDir, dlErr := downloadArtifacts(ctx, client, owner, repoName, wf.GetID(), artifactsPath)
+			if dlErr != nil {
+				log.Printf("failed to download artifacts: %s", dlErr)
+			} else if len(files) > 0 {
+				releaseURL := ""
+				if artifactsRepo != "" {
+					var persistErr error
+					script := fileName
+					if flakeRef != "" {
+						script = flakeRef
+					}
+					releaseURL, persistErr = persistToRelease(ctx, client, artifactsRepo, repoName, outDir, ReleaseMetadata{
+						Script:    script,
+						Runner:    runsOn,
+						StartTime: st,
+						EndTime:   time.Now(),
+						RunName:   repoName,
+					})
+					if persistErr != nil {
+						log.Printf("Warning: failed to persist artifacts to release: %s", persistErr)
+					} else {
+						fmt.Printf("Artifacts persisted to: %s\n", releaseURL)
+					}
+				}
+
+				script := fileName
+				if flakeRef != "" {
+					script = flakeRef
+				}
+				if appendErr := appendManifestEntry(ArtifactRun{
+					RunName:    repoName,
+					Timestamp:  time.Now(),
+					Script:     script,
+					Runner:     runsOn,
+					LocalPath:  outDir,
+					ReleaseURL: releaseURL,
+					Files:      files,
+				}); appendErr != nil {
+					log.Printf("Warning: failed to update artifact manifest: %s", appendErr)
+				}
 			}
 		}
 
@@ -430,18 +489,21 @@ By Alex Ellis %d - %s (%s)
 	}
 }
 
-func downloadArtifacts(ctx context.Context, client *github.Client, owner, repoName string, wfID int64, artifactsPath string) error {
+func downloadArtifacts(ctx context.Context, client *github.Client, owner, repoName string, wfID int64, artifactsPath string) ([]ArtifactFile, string, error) {
 	artifacts, _, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repoName, wfID, &github.ListOptions{
 		PerPage: 100,
 	})
 	if err != nil {
-		return err
+		return nil, "", err
 	}
+
+	var files []ArtifactFile
+	var outDir string
 
 	for _, a := range artifacts.Artifacts {
 		dlUrl, dlUrlRes, err := client.Actions.DownloadArtifact(ctx, owner, repoName, a.GetID(), 1)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 
 		if dlUrlRes.Body != nil {
@@ -449,19 +511,19 @@ func downloadArtifacts(ctx context.Context, client *github.Client, owner, repoNa
 		}
 
 		if dlUrlRes.StatusCode != http.StatusOK && dlUrlRes.StatusCode != http.StatusFound {
-			return fmt.Errorf("failed to get download URL with status: %d", dlUrlRes.StatusCode)
+			return nil, "", fmt.Errorf("failed to get download URL with status: %d", dlUrlRes.StatusCode)
 		}
 
 		req, err := http.NewRequest(http.MethodGet, dlUrl.String(), nil)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 		req.Header.Set("Accept", "application/vnd.github.v3+json")
 		req.Header.Set("User-Agent", "actuated-batch")
 
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 
 		if res.Body != nil {
@@ -471,17 +533,17 @@ func downloadArtifacts(ctx context.Context, client *github.Client, owner, repoNa
 		if res.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(res.Body)
 
-			return fmt.Errorf("failed to get logs with status: %d, body: %s", res.StatusCode, string(body))
+			return nil, "", fmt.Errorf("failed to get logs with status: %d, body: %s", res.StatusCode, string(body))
 		}
 
 		tmp := os.TempDir()
 		tmpFile, err := os.CreateTemp(tmp, a.GetName())
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 
 		if _, err := io.Copy(tmpFile, res.Body); err != nil {
-			return err
+			return nil, "", err
 		}
 
 		outPath := ""
@@ -489,23 +551,25 @@ func downloadArtifacts(ctx context.Context, client *github.Client, owner, repoNa
 			outPath = artifactsPath
 		}
 
-		artifactsPath, err := unzipArtifacts(tmpFile.Name(), outPath)
+		extractedPath, err := unzipArtifacts(tmpFile.Name(), outPath)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 
-		artifactsDir, err := os.ReadDir(artifactsPath)
+		outDir = extractedPath
+
+		artifactsDir, err := os.ReadDir(extractedPath)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 
-		fmt.Printf("Contents of: %s\n\n", artifactsPath)
+		fmt.Printf("Contents of: %s\n\n", extractedPath)
 		t := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', tabwriter.TabIndent)
 		fmt.Fprintf(t, "FILE\tSIZE\n")
 		for _, f := range artifactsDir {
 			i, _ := f.Info()
-			i.Size()
 			fmt.Fprintf(t, "%s\t%s\n", f.Name(), gounits.HumanSize(float64(i.Size())))
+			files = append(files, ArtifactFile{Name: f.Name(), Size: i.Size()})
 		}
 
 		fmt.Fprintf(t, "\n")
@@ -513,7 +577,7 @@ func downloadArtifacts(ctx context.Context, client *github.Client, owner, repoNa
 
 	}
 
-	return nil
+	return files, outDir, nil
 }
 
 func unzipArtifacts(target, outPath string) (string, error) {

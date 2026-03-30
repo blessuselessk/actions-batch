@@ -35,10 +35,11 @@ func Render(p RenderParams) (string, error) {
 }
 
 type RenderParams struct {
-	Name     string
-	Login    string
-	Date     string
-	RunsOn   string
-	Secrets  map[string]string
-	FlakeRef string
+	Name      string
+	Login     string
+	Date      string
+	RunsOn    string
+	Secrets   map[string]string
+	FlakeRef  string
+	Tailscale bool
 }

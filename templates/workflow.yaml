@@ -32,6 +32,16 @@ jobs:
     runs-on: {{ .RunsOn }}
     steps:
       - uses: actions/checkout@v1
+{{- if .Tailscale }}
+      - name: Join Tailscale mesh
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          tags: tag:runner
+          hostname: runner-${{ github.run_id }}
+          version: latest
+{{- end }}
       - name: Run the job
         run: |
           echo "HAS_UPLOADS=0" >> $GITHUB_ENV
